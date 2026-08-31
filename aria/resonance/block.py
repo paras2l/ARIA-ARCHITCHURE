@@ -105,6 +105,10 @@ def _clean_tokens(text: str, guard_keys: list[str]) -> list[str]:
 # Directed Edge Management
 # ---------------------------------------------------------------------------
 
+# Fast In-Memory Hash Map Edge Index for instant O(1) constant-time access
+_FAST_EDGE_MAP: dict[str, dict[str, dict]] = {}
+
+
 def _upsert_directed_edge(
     connections: dict,
     src_b: str,
@@ -117,28 +121,35 @@ def _upsert_directed_edge(
 ) -> bool:
     """
     Insert or update a directed edge: src_b → tgt_b with polarity (+1 / -1).
+    Uses O(1) Hash Map index for instant constant-time lookup.
     Returns True if this was a brand new edge, False if updated existing.
     """
+    global _FAST_EDGE_MAP
     if src_b not in connections:
         connections[src_b] = []
+        _FAST_EDGE_MAP[src_b] = {}
 
-    edge_list = connections[src_b]
-    for edge in edge_list:
-        if edge["to"] == tgt_b:
-            edge["count"] = edge.get("count", 0) + 1
-            edge["weight"] = round(min(edge["weight"] + weight_increment, 1.0), 6)
-            edge["dx"] = round(dx, 6)
-            edge["dy"] = round(dy, 6)
-            edge["dz"] = round(dz, 6)
-            # If ever negated, polarity becomes inhibitory (-1)
-            if polarity == -1:
-                edge["polarity"] = -1
-            elif "polarity" not in edge:
-                edge["polarity"] = 1
-            return False
+    src_map = _FAST_EDGE_MAP.get(src_b)
+    if src_map is None:
+        src_map = {e["to"]: e for e in connections[src_b] if "to" in e}
+        _FAST_EDGE_MAP[src_b] = src_map
+
+    edge = src_map.get(tgt_b)
+    if edge is not None:
+        edge["count"] = edge.get("count", 0) + 1
+        edge["weight"] = round(min(edge["weight"] + weight_increment, 1.0), 6)
+        edge["dx"] = round(dx, 6)
+        edge["dy"] = round(dy, 6)
+        edge["dz"] = round(dz, 6)
+        # If ever negated, polarity becomes inhibitory (-1)
+        if polarity == -1:
+            edge["polarity"] = -1
+        elif "polarity" not in edge:
+            edge["polarity"] = 1
+        return False
 
     # New directed edge
-    edge_list.append({
+    new_edge = {
         "to": tgt_b,
         "weight": round(min(weight_increment, 1.0), 6),
         "count": 1,
@@ -146,7 +157,9 @@ def _upsert_directed_edge(
         "dy": round(dy, 6),
         "dz": round(dz, 6),
         "polarity": int(polarity),
-    })
+    }
+    connections[src_b].append(new_edge)
+    src_map[tgt_b] = new_edge
     return True
 
 
@@ -224,16 +237,27 @@ def prune_synapses(
 # Damped Gravitational Coordinate Drift
 # ---------------------------------------------------------------------------
 
+from aria.resonance.accelerator import update_frequencies_gpu, get_hardware_info
+
+
 def update_frequencies(
     connections: dict,
     momentum: float = 0.85,
-) -> int:
+) -> tuple[int, float]:
     """
     Smoothly drift word coordinates toward their connected neighbors.
-    Uses momentum damping (default 85% old position + 15% neighbor pull).
-    Inhibitory (polarity: -1) edges gently push away instead of pull.
+    Uses GPU (CUDA Tensors) if available, otherwise pure CPU fallback.
     """
     drift_pull = 1.0 - momentum
+
+    # 1. Try Vectorized PyTorch CUDA GPU Acceleration first
+    gpu_updated, gpu_loss = update_frequencies_gpu(
+        connections, _store, update_frequency_by_binary, momentum=momentum, drift_pull=drift_pull
+    )
+    if gpu_updated > 0:
+        return gpu_updated, gpu_loss
+
+    # 2. CPU Fallback Execution
     updated_count = 0
     total_displacement = 0.0
 
@@ -314,6 +338,22 @@ def run_block1(
                 active_anchor = header_clean
                 auto_register(active_anchor)
                 break
+
+    from aria.resonance.accelerator import is_cuda_active, batch_resonance_cuda
+    import aria.guard.layer as guard_module
+
+    # Fast Vectorized CUDA GPU Acceleration if available
+    if is_cuda_active():
+        sentences_tokens = [
+            re.findall(r"\b[A-Za-z0-9\-_]{2,}\b", s)
+            for s in re.split(r"[.!?\n\r]+", script_text)
+            if s.strip()
+        ]
+        res_gpu = batch_resonance_cuda(sentences_tokens, connections, guard_module, pass_num=pass_num)
+        res_gpu["avg_directions"] = 16
+        res_gpu["document_anchor"] = active_anchor
+        res_gpu["time_s"] = round(time.time() - t0, 4)
+        return res_gpu
 
     anchor_b = get_binary(active_anchor) if active_anchor else None
     anchor_pos = get_frequency_by_binary(anchor_b) if anchor_b else None

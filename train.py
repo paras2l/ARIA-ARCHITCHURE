@@ -216,10 +216,14 @@ def train_master(
     is_kaggle = os.path.exists("/kaggle")
     env_name = "Kaggle Cloud" if is_kaggle else "Local PC / Workstation"
 
+    from aria.resonance.accelerator import get_hardware_info
+    hw = get_hardware_info()
+
     print("\n" + "="*70)
     print("🚀 ARIA MASTER BRAIN TRAINING ENGINE")
     print("="*70)
     print(f"ENV            : {env_name}")
+    print(f"Device Mode    : {hw['display']}")
     print(f"Output Dir     : {out_dir}")
     print(f"Active Slot    : {slot}")
     print(f"Max Epochs     : {max_passes} Passes (Auto-Stopping on 0 new connections)")
